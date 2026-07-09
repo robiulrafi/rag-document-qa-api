@@ -2,7 +2,7 @@
 
 A production-shaped question-answering API built on a **locally-hosted LLM** — no API keys, no per-token cost, no data leaving the machine.
 
-This repository replicates the architecture of a production retrieval-augmented generation system I built at a Fortune 500 logistics company, where the deployed pipeline served **500k+ daily queries** and drove **$40M in quarterly revenue**. This public version uses open datasets and open models to demonstrate the same retrieval pipeline, prompt orchestration, and evaluation approach.
+This repository replicates the architecture of a production retrieval-augmented generation system I built at a Fortune 500 logistics company, where the deployed pipeline served **25k+ daily queries** and drove **$40M in quarterly revenue**. This public version uses open datasets and open models to demonstrate the same retrieval pipeline, prompt orchestration, and evaluation approach.
 
 > **Note:** This repository uses public datasets and open-source models only. It contains no proprietary data, internal systems, or confidential information from any employer.
 
