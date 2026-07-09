@@ -1,8 +1,10 @@
 # RAG Document Q&A API
 
-A production-shaped question-answering API built on a **locally-hosted LLM** — no API keys, no per-token cost, no data leaving the machine.
+A question-answering API built on a **locally-hosted LLM** — no API keys, no per-token cost, no data leaving the machine.
 
-This repository replicates the architecture of a production retrieval-augmented generation system I built at a Fortune 500 logistics company, where the deployed pipeline served **25k+ daily queries** and drove **$40M in quarterly revenue**. This public version uses open datasets and open models to demonstrate the same retrieval pipeline, prompt orchestration, and evaluation approach.
+The service currently exposes a LangChain (LCEL) chain over a local `llama3.2` model through FastAPI, with token streaming and schema-validated structured output. Retrieval is the next milestone: PDF ingestion, embeddings, a vector store, and a grounded `/query` endpoint that answers only from source documents.
+
+It mirrors the architecture of a production retrieval-augmented generation system I built at enterprise scale, rebuilt here on open models and public data so the pipeline, prompt orchestration, and evaluation approach can be inspected end to end.
 
 > **Note:** This repository uses public datasets and open-source models only. It contains no proprietary data, internal systems, or confidential information from any employer.
 
@@ -25,6 +27,8 @@ This repository replicates the architecture of a production retrieval-augmented 
 
 ## Architecture
 
+**Today**
+
 ```
                   ┌────────────────────────┐
    HTTP request   │      FastAPI app       │
@@ -39,7 +43,17 @@ This repository replicates the architecture of a production retrieval-augmented 
                   └────────────────────────┘
 ```
 
-Retrieval (ChromaDB + embeddings) slots in between the chain and the model in the next milestone.
+**Next milestone** — retrieval slots in ahead of the model, so answers are grounded in source documents rather than the model's parametric memory:
+
+```
+   PDF ──► chunk ──► embed ──► ChromaDB
+                                   │
+   question ──► embed ──► similarity search
+                                   │
+                          retrieved context
+                                   ▼
+                     prompt | llm | parser  ──► grounded answer
+```
 
 ---
 
