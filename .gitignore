@@ -1,0 +1,20 @@
+# Environment
+.env
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Vector store (generated locally)
+chroma_db/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
