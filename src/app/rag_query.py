@@ -1,11 +1,18 @@
-"""RAG: retrieve relevant chunks from the vector store, then answer from them.
+"""RAG: hybrid retrieval over an ingested document, then a grounded answer.
 
 This module only READS the vector store. Ingestion (writing) lives in
 ingest.py and runs separately — mixing the two is what causes duplicate
 chunks, because Chroma.from_documents() appends on every call.
+
+Retrieval is hybrid: a dense vector search (semantic) merged with BM25
+(exact keyword). The BM25 index is rebuilt in memory at startup from the
+documents already stored in Chroma, so there is still a single source of
+truth and no second index to keep in sync.
 """
 
 from langchain_chroma import Chroma
+from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama, OllamaEmbeddings
@@ -13,7 +20,8 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 CHROMA_DIR = "./chroma_db"
 EMBED_MODEL = "nomic-embed-text"
 CHAT_MODEL = "llama3.2"
-TOP_K = 3
+TOP_K = 3          # per retriever
+MAX_CONTEXT = 5    # cap after merging, to bound prompt size
 
 
 # --------------------------------------------------------------------------
@@ -53,11 +61,33 @@ REWRITE_PROMPT = ChatPromptTemplate.from_messages(
 # --------------------------------------------------------------------------
 embeddings = OllamaEmbeddings(model=EMBED_MODEL)
 
-# NOTE: Chroma(...) READS an existing store. Never use from_documents() here.
+# Chroma(...) READS an existing store. Never use from_documents() here.
 store = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
-retriever = store.as_retriever(search_kwargs={"k": TOP_K})
+vector_retriever = store.as_retriever(search_kwargs={"k": TOP_K})
 
-# temperature=0: faithful, reproducible answers — not creativity.
+
+def _load_chunks_from_store() -> list[Document]:
+    """Read every stored chunk back out of Chroma, as Documents.
+
+    Chroma persists the original text alongside the vectors, so BM25 can be
+    rebuilt from the store itself — no need to re-parse the source PDF, and
+    no second index file to keep in sync.
+    """
+    raw = store.get()  # {'ids': [...], 'documents': [...], 'metadatas': [...]}
+    return [
+        Document(page_content=text, metadata=meta or {})
+        for text, meta in zip(raw["documents"], raw["metadatas"])
+    ]
+
+
+# BM25 is an in-memory index — unlike Chroma it does not persist, so it is
+# rebuilt on each startup. Cheap at this scale; at large scale you would use
+# a store that does both keyword and vector search (e.g. OpenSearch).
+_chunks = _load_chunks_from_store()
+bm25_retriever = BM25Retriever.from_documents(_chunks) if _chunks else None
+if bm25_retriever:
+    bm25_retriever.k = TOP_K
+
 llm = ChatOllama(model=CHAT_MODEL, temperature=0)
 
 rag_chain = RAG_PROMPT | llm | StrOutputParser()
@@ -65,9 +95,29 @@ rewrite_chain = REWRITE_PROMPT | llm | StrOutputParser()
 
 
 # --------------------------------------------------------------------------
-# Functions
+# Retrieval
 # --------------------------------------------------------------------------
-def format_context(docs) -> str:
+def hybrid_search(query: str) -> list[Document]:
+    """Merge dense (semantic) and sparse (keyword) retrieval.
+
+    Vector search matches meaning — "cost" finds a clause that says "fee".
+    BM25 matches exact tokens — party names, case numbers, dollar figures —
+    which dense embeddings represent weakly. Running both covers each one's
+    blind spot.
+    """
+    hits: list[Document] = vector_retriever.invoke(query)
+    if bm25_retriever:
+        hits = hits + bm25_retriever.invoke(query)
+
+    seen, merged = set(), []
+    for doc in hits:
+        if doc.page_content not in seen:
+            seen.add(doc.page_content)
+            merged.append(doc)
+    return merged[:MAX_CONTEXT]
+
+
+def format_context(docs: list[Document]) -> str:
     """Number each chunk so the model can cite it by index."""
     parts = []
     for i, doc in enumerate(docs, 1):
@@ -80,7 +130,7 @@ def rewrite_query(question: str, history: list[str]) -> str:
     """Turn a context-dependent follow-up into a standalone search query.
 
     "When is it due?" + history  ->  "When is the $25,000 monthly fee due?"
-    Skipped entirely when there is no history, to avoid a wasted LLM call.
+    Skipped when there is no history, to avoid a wasted LLM call.
     """
     if not history:
         return question
@@ -97,8 +147,8 @@ def answer_question(question: str, history: list[str] | None = None):
 
     Returns (answer, retrieved_docs) so the caller can cite sources.
     """
-    search_query = rewrite_query(question, history or [])   # rewrite for retrieval
-    docs = retriever.invoke(search_query)                   # 1. RETRIEVE
+    search_query = rewrite_query(question, history or [])
+    docs = hybrid_search(search_query)                      # 1. RETRIEVE
     context = format_context(docs)                          # 2. AUGMENT
     answer = rag_chain.invoke(                              # 3. GENERATE
         {"context": context, "question": question}
@@ -107,11 +157,15 @@ def answer_question(question: str, history: list[str] | None = None):
 
 
 if __name__ == "__main__":
+    print(f"Loaded {len(_chunks)} chunks from the store "
+          f"(BM25: {'on' if bm25_retriever else 'off'})")
+
     tests = [
-        ("How much does the service cost?", []),
-        ("What is the employee vacation policy?", []),          # not in the doc
+        ("How much does the service cost?", []),            # semantic win
+        ("Northwind Trading", []),                          # exact-term / BM25 win
+        ("What is the employee vacation policy?", []),      # not in the doc
         (
-            "When is it due?",                                   # follow-up
+            "When is it due?",                              # follow-up
             ["Q: How much does the service cost?",
              "A: The monthly fee is $25,000."],
         ),
