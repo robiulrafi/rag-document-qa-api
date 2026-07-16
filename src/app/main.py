@@ -47,14 +47,13 @@ class HealthResponse(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    """A question to answer using only the ingested document."""
 
     question: str = Field(min_length=1, description="Question about the document")
-
+    history: list[str] = Field(default=[], description="Prior turns, oldest first")
 
 class Source(BaseModel):
     """One retrieved chunk, returned so the answer is traceable."""
-
+    id: int
     page: int | str
     excerpt: str
 
@@ -106,7 +105,7 @@ async def query(req: QueryRequest) -> QueryResponse:
     model is instructed to say so rather than guess.
     """
     start = time.perf_counter()
-    answer, docs = answer_question(req.question)
+    answer, docs = answer_question(req.question, req.history)
     latency_ms = round((time.perf_counter() - start) * 1000)
 
     # Structured log: one JSON line per query, ready for evaluation later.
@@ -126,9 +125,10 @@ async def query(req: QueryRequest) -> QueryResponse:
         answer=answer,
         sources=[
             Source(
+                id=i,
                 page=d.metadata.get("page", "?"),
                 excerpt=d.page_content[:150],
             )
-            for d in docs
+            for i, d in enumerate(docs, 1)
         ],
     )
