@@ -23,8 +23,8 @@ It mirrors the architecture of a production retrieval-augmented generation syste
 | Numbered source citations | ✅ Done |
 | History-aware retrieval (multi-turn follow-ups) | ✅ Done |
 | Hybrid retrieval (BM25 + vector) | ✅ Done |
-| RAGAS evaluation harness | 🔜 Next |
-| Reranking + semantic chunking | 🔜 Planned |
+| LLM-as-judge evaluation harness | ✅ Done |
+| Reranking + structure-aware chunking | 🔜 Next |
 | Docker + CI/CD + live deployment | 🔜 Planned |
 
 ---
@@ -180,6 +180,38 @@ curl -X POST http://localhost:8000/query \
 
 ---
 
+## Evaluation
+
+Quality is measured, not eyeballed. `evaluate_rag.py` runs a golden set of
+questions through the live pipeline and scores three metrics with an LLM judge.
+
+```bash
+python evaluate_rag.py
+```
+
+| Metric | Score | What it means |
+|---|---|---|
+| **Faithfulness** | 0.96 | Fraction of the answer's factual claims that the retrieved context supports. The hallucination metric. |
+| **Answer relevancy** | 1.00 | Does the answer address the question? An honest refusal counts. |
+| **Context precision** | 0.21 | Fraction of retrieved chunks that are actually relevant. |
+
+*Judge: `llama3.1:8b`, deliberately a different and stronger model than the one
+under test. Golden set: 6 questions, including one the document does not answer.*
+
+**Faithfulness 0.96 and relevancy 1.00** are the grounding working — every claim
+traces to the context, and the refusal case scores 1.0 because an answer with no
+factual claims has nothing to hallucinate.
+
+**Context precision 0.21 is the real finding.** Hybrid retrieval trades precision
+for recall: roughly four of every five retrieved chunks are noise. On a
+payment-timing question the retriever returned the fees clause alongside
+limitation-of-liability, governing-law, and confidentiality clauses. The model
+ignored them and answered correctly — but they cost prompt tokens and latency.
+**This is the number a reranking stage should move**, and it is the next thing on
+the roadmap.
+
+---
+
 ## Tests
 
 The suite mocks the LLM, so it runs offline and in CI without an Ollama process.
@@ -202,6 +234,30 @@ pytest -v
 
 **Why ingestion is a separate module.** `Chroma.from_documents()` **appends** — it is not idempotent. Running ingestion inside the query path silently duplicated every chunk on each call, polluting retrieval until the store held ~10 copies and returned the same chunk three times. `ingest.py` writes; `rag_query.py` only reads. Handling document *updates* properly needs deterministic chunk IDs (hash of source + page + index) so re-ingestion upserts rather than appends.
 
+**Why the evaluation judge is a different model.** The first version of the eval
+harness asked the judge for "a number between 0.0 and 1.0" and got 0.5 back on 14
+of 18 scores — including a refusal that makes no factual claims and should have
+been 1.0. The judge was hedging, not evaluating: small models cannot produce
+calibrated continuous scores. The fix is to never ask for a score — decompose the
+answer into atomic claims, ask a binary YES/NO per claim, and compute the fraction
+arithmetically. That is what RAGAS does internally, and it is why it tolerates
+weaker judges. Running the judge on `llama3.2` (the generation model) then scored
+relevancy 0.50 and precision 0.13 while the answers were correctly citing their
+retrieved chunks — a self-contradiction, since a chunk that yields a faithful
+answer is by definition relevant. Swapping to `llama3.1:8b` moved relevancy to
+1.00 and made claim extraction meaningful (1 claim per answer → 3–5). **The judge
+was wrong, not the system.** A small model can do near-extractive judgments
+("does this context support this claim?") but not abstract relevance judgments.
+Validate the judge before trusting the metric — an unvalidated harness will
+confidently tell you to fix things that aren't broken.
+
+**Why RAGAS isn't used.** It was the intended tool. It pins to LangChain internals
+that have since moved: `scikit-network` had no wheel for the installed Python,
+RAGAS imported a `langchain_community` module that had been deleted, and pinning
+`langchain-community` backwards to satisfy it broke `langchain-ollama`. The
+metrics are ~60 lines of prompt and arithmetic, so they are implemented directly.
+A dependency that costs more than the thing it does is not worth the dependency.
+
 **Why `temperature=0`.** For grounded Q&A the goal is faithful, reproducible answers, not creativity.
 
 **Why streaming.** A single-shot response makes the user wait for the whole generation — measured at ~18s locally for a cold model. Streaming over SSE emits each token as produced, so time-to-first-token drops to milliseconds. Perceived latency, not total latency, is what users judge.
@@ -220,8 +276,8 @@ pytest -v
 
 ## Roadmap
 
-1. RAGAS evaluation — faithfulness and answer relevancy tracked as regression tests
-2. Structure-aware chunking and cross-encoder reranking
+1. Cross-encoder reranking — retrieve broadly, keep only the relevant few (target: context precision 0.21 → 0.6+)
+2. Structure-aware chunking — split on section headings so a clause is never severed
 3. Metadata filtering for access control (retrieve only what a user may see)
 4. Containerization, CI/CD, and a live deployment
 
