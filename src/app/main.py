@@ -12,16 +12,24 @@ Run locally:
     uvicorn src.app.main:app --reload
 """
 
-import json
+import logging
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .chains import Answer, build_qa_chain, build_structured_chain
 from .config import settings
 from .rag_query import answer_question
+
+# Configure logging once, at import. Levels + timestamps + module name, and a
+# single place to change how logs are formatted or routed later.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title=settings.API_TITLE, version=settings.API_VERSION)
 
@@ -47,12 +55,13 @@ class HealthResponse(BaseModel):
 
 
 class QueryRequest(BaseModel):
-
     question: str = Field(min_length=1, description="Question about the document")
     history: list[str] = Field(default=[], description="Prior turns, oldest first")
 
+
 class Source(BaseModel):
     """One retrieved chunk, returned so the answer is traceable."""
+
     id: int
     page: int | str
     excerpt: str
@@ -105,20 +114,28 @@ async def query(req: QueryRequest) -> QueryResponse:
     model is instructed to say so rather than guess.
     """
     start = time.perf_counter()
-    answer, docs = answer_question(req.question, req.history)
+
+    # Retrieval + generation can fail if a dependency is down (Ollama not
+    # running, ChromaDB unreadable). Catch it, log the real cause server-side,
+    # and return a clean 503 — never leak a stack trace to the caller.
+    try:
+        answer, docs = answer_question(req.question, req.history)
+    except Exception:
+        logger.exception("query failed for question=%r", req.question)
+        raise HTTPException(
+            status_code=503,
+            detail="The model service is temporarily unavailable. Please try again.",
+        )
+
     latency_ms = round((time.perf_counter() - start) * 1000)
 
-    # Structured log: one JSON line per query, ready for evaluation later.
-    print(
-        json.dumps(
-            {
-                "event": "query",
-                "question": req.question,
-                "latency_ms": latency_ms,
-                "chunks_retrieved": len(docs),
-                "pages": [d.metadata.get("page") for d in docs],
-            }
-        )
+    # Structured log via the logging module (levels, timestamps, routable) —
+    # replaces print(). One record per query, ready for evaluation/monitoring.
+    logger.info(
+        "query completed | latency_ms=%d chunks=%d pages=%s",
+        latency_ms,
+        len(docs),
+        [d.metadata.get("page") for d in docs],
     )
 
     return QueryResponse(
