@@ -24,6 +24,7 @@ It mirrors the architecture of a production retrieval-augmented generation syste
 | History-aware retrieval (multi-turn follow-ups) | ✅ Done |
 | Hybrid retrieval (BM25 + vector) | ✅ Done |
 | LLM-as-judge evaluation harness | ✅ Done |
+| Error handling + structured logging | ✅ Done |
 | Reranking + structure-aware chunking | 🔜 Next |
 | Docker + CI/CD + live deployment | 🔜 Planned |
 
@@ -257,6 +258,8 @@ RAGAS imported a `langchain_community` module that had been deleted, and pinning
 `langchain-community` backwards to satisfy it broke `langchain-ollama`. The
 metrics are ~60 lines of prompt and arithmetic, so they are implemented directly.
 A dependency that costs more than the thing it does is not worth the dependency.
+
+**Why `/query` catches its own failures.** Retrieval and generation depend on external services — the Ollama model server and the on-disk vector store. If either is down, the naive result is a 500 with a full Python traceback sent to the client, which is both a poor experience and an information-disclosure risk (it exposes internal paths and stack frames). Instead the endpoint wraps the call in `try/except`: the real traceback is logged server-side with `logger.exception`, and the caller gets a clean `503` with a safe message. Verified by stopping Ollama mid-run — the client received the 503, the diagnostic trace landed in the logs. Logging goes through the `logging` module rather than `print`, so records carry levels and timestamps and can be routed to a collector without code changes.
 
 **Why `temperature=0`.** For grounded Q&A the goal is faithful, reproducible answers, not creativity.
 
