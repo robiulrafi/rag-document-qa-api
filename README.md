@@ -1,291 +1,210 @@
 # RAG Document Q&A API
 
-A retrieval-augmented question-answering API built on a **locally-hosted LLM** — no API keys, no per-token cost, no data leaving the machine.
+A production-oriented Retrieval-Augmented Generation system that answers questions
+about a document with **grounded, cited answers** — and refuses when the answer
+isn't there. Built to handle the failure modes that separate a demo from something
+you'd trust: hallucination, missing citations, and unmeasured retrieval quality.
 
-Point it at a PDF and ask questions. It retrieves the relevant passages, answers **only** from them, cites the source of every claim, and says *"I don't know"* when the answer isn't in the document. That grounding is the point: a system that confidently invents answers is worse than useless for contracts, policies, or case law.
+Runs fully locally (Ollama + ChromaDB) — no API keys, no data leaving the machine,
+which matters for the confidential-document use cases this targets.
 
-It mirrors the architecture of a production retrieval-augmented generation system I built at enterprise scale, rebuilt here on open models and public data so the pipeline, prompt orchestration, and evaluation approach can be inspected end to end.
-
-> **Note:** This repository uses public datasets and open-source models only. It contains no proprietary data, internal systems, or confidential information from any employer.
+**Stack:** Python · FastAPI · LangChain (LCEL) · LangGraph · Ollama (llama3.2) ·
+ChromaDB · nomic-embed-text · BM25 · cross-encoder reranking · pytest
 
 ---
 
-## Status
+## What it does
 
-| Milestone | State |
-|---|---|
-| LangChain (LCEL) chain on local Ollama | ✅ Done |
-| FastAPI service — `/ask`, `/stream`, `/health` | ✅ Done |
-| Structured output with schema validation | ✅ Done |
-| Test suite (mocked LLM, runs offline) | ✅ Done |
-| PDF ingestion → chunking → embeddings → ChromaDB | ✅ Done |
-| Grounded RAG `/query` endpoint with refusal | ✅ Done |
-| Numbered source citations | ✅ Done |
-| History-aware retrieval (multi-turn follow-ups) | ✅ Done |
-| Hybrid retrieval (BM25 + vector) | ✅ Done |
-| LLM-as-judge evaluation harness | ✅ Done |
-| Error handling + structured logging | ✅ Done |
-| Reranking + structure-aware chunking | 🔜 Next |
-| Docker + CI/CD + live deployment | 🔜 Planned |
+- **Ingests** a PDF, chunks it on section boundaries, embeds it, stores vectors in ChromaDB
+- **Retrieves** with a two-stage funnel: hybrid (vector + BM25) recall, then cross-encoder reranking for precision
+- **Generates** answers grounded strictly in retrieved context, with inline citations
+- **Refuses** honestly ("I don't know — that isn't covered in the document") when the answer isn't present
+- **Handles multi-turn** — rewrites follow-up questions into standalone queries before retrieval
+- **Self-corrects** (optional agentic path) — grades retrieved context and rewrites the query to retry when it's too weak
+- **Evaluates itself** with an LLM-as-judge harness measuring faithfulness, relevancy, and context precision
 
 ---
 
 ## Architecture
 
-**Ingestion** — runs once, offline, when documents change:
-
 ```
-   document.pdf
-        │
-        ▼
-   PyPDFLoader ──► RecursiveCharacterTextSplitter ──► chunks
-                                                        │
-                                                        ▼
-                                        nomic-embed-text  (768-dim vectors)
-                                                        │
-                                                        ▼
-                                        ChromaDB  (persisted to disk)
+INGESTION (offline, writes the store)          QUERY (online, reads the store)
+─────────────────────────────────────          ──────────────────────────────────────
+PDF                                             question
+ └─ structure-aware chunking                     └─ (rewrite follow-up if multi-turn)
+     └─ embed (nomic-embed-text)                     └─ HYBRID retrieve (vector + BM25)  ← recall
+         └─ ChromaDB                                     └─ cross-encoder RERANK (top 3) ← precision
+                                                             └─ grounded generation + citations
+                                                                 └─ answer  |  or honest refusal
 ```
 
-**Query** — runs per request:
-
-```
-   question (+ conversation history)
-        │
-        ▼
-   rewrite follow-up into a standalone query
-        │
-        ├──────────────┬──────────────┐
-        ▼              ▼              │
-   embed query    BM25 keyword        │   1. RETRIEVE
-        │              │              │
-        ▼              ▼              │
-   ChromaDB        BM25 index         │
-   (cosine sim)    (exact terms)      │
-        │              │              │
-        └──────┬───────┘              │
-               ▼                      │
-        merge + dedupe ───────────────┘
-               │
-               ▼
-   numbered context: "[1] (page 0) ..."      2. AUGMENT
-               │
-               ▼
-   grounding prompt: "answer ONLY from context,
-   cite [n], say I don't know if absent"
-               │
-               ▼
-   llama3.2 (Ollama, local)                  3. GENERATE
-               │
-               ▼
-   grounded answer + numbered citations
-```
-
-The LLM never fetches anything. Retrieval happens in application code; the model receives the chunks as plain text in its prompt. That separation is what **R**etrieve → **A**ugment → **G**enerate actually means.
+Ingestion and query are deliberately separate modules. Ingestion *writes*; query
+*reads*. Mixing them causes duplicate chunks, because `Chroma.from_documents()`
+appends on every call.
 
 ---
 
-## Endpoints
+## Retrieval quality — investigation and results
 
-| Method | Path | Description |
+The interesting part of this project isn't that it works — it's the measured
+investigation into *why* it initially didn't, and what fixed it.
+
+### The investigation
+
+Initial context precision was **0.21**, and an answerable question — "how much does
+the service cost?" — failed to surface the fee at all. Rather than guess at a fix,
+I traced it:
+
+1. **Measured the failure** — the cost query never returned the fee chunk.
+2. **Ruled out query phrasing** — rewording returned the same wrong chunks, so query rewriting wouldn't have helped.
+3. **Ruled out retrieval method** — BM25 keyword search *also* missed it, so hybrid alone wouldn't have fixed it.
+4. **Found the root cause** — the "$25,000 monthly fee" sentence was trapped in a chunk *dominated by termination text*. Character-based splitting (`chunk_size=250`) had cut across the Section 2 → Section 3 boundary, gluing the termination tail to the fees head. No retriever can rank a mixed-topic chunk well for a single-topic question.
+
+### The fixes (three distinct problems, three distinct fixes)
+
+**Structure-aware chunking** — split on section headers (`\n(?=\d+\.\s+[A-Z])`) so each
+numbered clause is its own chunk. The fee clause became a clean, fee-only chunk that
+ranks #1 for "how much does it cost." *This fixed the answers:* faithfulness rose to
+**0.89**, and previously-broken questions now resolve correctly.
+
+**Hybrid retrieval** — vector search unioned with BM25, so exact terms (party names,
+dollar amounts, statute numbers) that dense embeddings represent weakly are still
+caught. This improves *recall robustness* — it does **not** raise precision, because
+it doesn't change how many chunks are retrieved (confirmed: precision stayed 0.18).
+
+**Cross-encoder reranking** — a two-stage funnel: hybrid retrieves ~10 candidates
+(recall), then a cross-encoder (`ms-marco-MiniLM-L-6-v2`) scores each (query, chunk)
+pair jointly and keeps the top 3 (precision). Unlike embeddings, which encode query
+and chunk separately, a cross-encoder reads them together — more accurate, but too
+slow to run over the whole corpus, so it reranks a small candidate set. **This moved
+context precision from 0.18 to 0.33.**
+
+### An honest measurement note
+
+An early "improved" precision of 0.33 turned out to be inflated: `Chroma.from_documents()`
+appends, and re-ingesting without clearing the store left duplicate and stale chunks.
+On a clean single-ingest store the baseline was **0.18** — the true starting point.
+The production fix is deterministic chunk IDs so re-ingesting *upserts* instead of
+appending.
+
+### Results (6-question golden set, llama3.1:8b judge)
+
+| Metric | Value | Notes |
 |---|---|---|
-| `GET` | `/health` | Liveness probe; reports the loaded model |
-| `POST` | `/query` | **RAG** — grounded answer from the ingested document, with citations |
-| `POST` | `/ask` | Ungrounded answer from the model's own knowledge |
-| `POST` | `/stream` | Streams tokens as they generate (Server-Sent Events) |
-| `POST` | `/ask/structured` | Schema-validated JSON (`summary`, `confidence`) |
+| Faithfulness | 0.89 | claims supported by retrieved context |
+| Answer relevancy | 1.00 | answer addresses the question |
+| Context precision | 0.33 | after reranking (0.18 before); directional |
 
-`/ask` and `/query` answer the same question two ways — one from the model's parametric memory, one grounded in your documents. Useful for demonstrating what grounding actually buys you.
-
-Interactive docs at `/docs` when running.
+**Precision progression:** 0.18 (clean baseline, hybrid only) → **0.33** (with reranking).
+The remaining ceiling is the corpus itself: this 10-section contract has ~1 answer
+chunk per question, so retrieving 3 caps precision near 0.33 for single-answer
+questions. Reranking's benefit scales with corpus size — filtering 3-of-10 here, but
+3-of-hundreds in production, where the gain is far larger.
 
 ---
 
-## Quickstart
+## Evaluation harness
 
-**Prerequisites:** Python 3.11+ and [Ollama](https://ollama.com/download).
+`evaluate_rag.py` implements LLM-as-judge metrics directly (RAGAS pins to LangChain
+internals that have since moved). Two design decisions came out of measurement:
+
+**Never ask the judge for a score.** A first version asked for "a number between 0.0
+and 1.0" and got 0.5 on 14 of 18 scores — including a refusal that should have been
+1.0. Small models can't produce calibrated continuous scores. The fix: decompose the
+answer into atomic claims and ask a *binary* YES/NO per claim, then compute the metric
+arithmetically. That's what RAGAS does internally.
+
+**The judge must be a different, stronger model than the one under test.** With the
+generation model (llama3.2) as judge, relevancy scored 0.50 while answers were
+correctly citing chunks — a self-contradiction. Swapping to llama3.1:8b fixed it.
+A small model can do near-extractive judgments (does this context support this claim?)
+but not abstract relevance judgments. *Validate the judge before trusting the metric —
+an unvalidated harness will confidently tell you to fix things that aren't broken.*
+
+---
+
+## Agentic RAG (LangGraph) — optional self-correcting path
+
+`langgraph_selfcorrect.py` implements a self-correcting retrieval loop as a LangGraph
+state machine. It adds one capability a straight chain can't express: a **conditional
+branch and a cycle**.
+
+```
+START → retrieve → grade ──good────→ generate → END
+          ↑          │
+          │          ├──retry───→ rewrite ──┐
+          │          │                      │  (cycle)
+          │          └──give_up─→ generate  │
+          └──────────────────────────────────┘
+```
+
+- **grade** judges each retrieved chunk for relevance (llama3.1:8b — the "don't let a model grade its own homework" lesson from the eval harness)
+- If context is too weak and retries remain, **rewrite** reformulates the query and loops back to retrieve
+- A loop guard (`MAX_ATTEMPTS`) prevents infinite cycling — an unanswerable question retries twice, then gives up and produces an honest refusal rather than an error
+
+**Design decisions worth noting:**
+- *Grade before generate* — fail fast at the cheap step; don't spend an ~18s generation on noise
+- *give_up routes to generate* — so an out-of-retries path still produces a grounded refusal, not a crash
+- *Defensive output parsing* — the rewrite node strips model preamble (small models add "Here is a rewritten version:..."), so a chatty model can't poison the next retrieval
+
+**Honest scope:** this is the *agentic capability*, not a metrics win. The investigation
+above showed query rewriting does not fix this project's core failure (chunking did),
+so the self-correcting loop's value is graceful handling of unanswerable questions and
+the agentic architecture itself — not improved precision. The API uses the straight
+path by default (lower latency); the self-correcting path is available for hard queries.
+
+---
+
+## Known limitations → next steps
+
+- **Wrong citation index (occasional)** — the small model sometimes cites correct information under the wrong bracket number; needs a citation-correctness check.
+- **Naive hybrid merge** — concatenation, not rank fusion. The proper fix is Reciprocal Rank Fusion (score each doc by sum of 1/(k+rank) across retrievers), which works on ranks rather than raw scores — cosine similarity and BM25 scores aren't on comparable scales.
+- **Non-idempotent ingestion** — deterministic chunk IDs would make re-ingestion upsert instead of append.
+- **Section regex** fits numbered clauses; production needs format-agnostic structure detection.
+- **Scalability** (discussion): millions of docs → managed vector store; many users → the ~18s generation is the bottleneck, needs batching/GPU/streaming; access control → metadata filtering at retrieval; cost → a semantic cache (e.g. Redis) so repeated queries skip generation.
+
+---
+
+## Running it
 
 ```bash
-# 1. Pull the models (~2.3 GB total, runs on 8 GB RAM)
-ollama pull llama3.2            # generation
-ollama pull nomic-embed-text    # embeddings
-
-# 2. Clone and enter
-git clone https://github.com/robiulrafi/rag-document-qa-api.git
-cd rag-document-qa-api
-
-# 3. Isolated environment
-python -m venv venv
-source venv/Scripts/activate      # Windows (Git Bash)
-# source venv/bin/activate        # macOS / Linux
-
-# 4. Install
+# 1. install
 pip install -r requirements.txt
 
-# 5. Ingest a document — run ONCE per document
-python -m src.app.ingest
+# 2. pull models (Ollama must be running)
+ollama pull llama3.2
+ollama pull llama3.1:8b
+ollama pull nomic-embed-text
 
-# 6. Run
-uvicorn src.app.main:app --reload
-```
+# 3. ingest a document (clear the store first — ingestion appends)
+rm -rf chroma_db
+python ingest.py
 
-Open <http://localhost:8000/docs>.
+# 4. query from the command line
+python -m src.app.rag_query
 
-No configuration, no API key. Inference runs against your local Ollama instance, and every setting in `src/app/config.py` has a working default. Override one with an environment variable:
+# 5. or run the self-correcting graph
+python -m src.app.langgraph_selfcorrect
 
-```bash
-OLLAMA_MODEL=qwen3:8b uvicorn src.app.main:app --reload
-```
-
----
-
-## Usage
-
-```bash
-# Grounded question — answered from the document
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "How much does the service cost?"}'
-```
-
-```json
-{
-  "answer": "The monthly service fee is $25,000 [3].",
-  "sources": [
-    {"id": 1, "page": 0, "excerpt": "1. Definitions..."},
-    {"id": 2, "page": 0, "excerpt": "payments accrue interest at 1.5%..."},
-    {"id": 3, "page": 0, "excerpt": "3. Fees and Payment. Client shall pay..."}
-  ]
-}
-```
-
-```bash
-# Question the document does NOT answer — it refuses rather than inventing
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is the employee vacation policy?"}'
-# → "I don't know — that isn't covered in the document."
-```
-
-```bash
-# Follow-up question — history lets it resolve "it"
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-        "question": "When is it due?",
-        "history": ["Q: How much does the service cost?",
-                    "A: The monthly fee is $25,000."]
-      }'
-# → "The monthly fee of $25,000 is due within thirty (30) days of invoice [1]."
-```
-
----
-
-## Evaluation
-
-Quality is measured, not eyeballed. `evaluate_rag.py` runs a golden set of
-questions through the live pipeline and scores three metrics with an LLM judge.
-
-```bash
+# 6. run the evaluation harness
 python evaluate_rag.py
-```
 
-| Metric | Score | What it means |
-|---|---|---|
-| **Faithfulness** | 0.96 | Fraction of the answer's factual claims that the retrieved context supports. The hallucination metric. |
-| **Answer relevancy** | 1.00 | Does the answer address the question? An honest refusal counts. |
-| **Context precision** | 0.21 | Fraction of retrieved chunks that are actually relevant. |
+# 7. serve the API
+uvicorn src.app.main:app --reload
 
-*Judge: `llama3.1:8b`, deliberately a different and stronger model than the one
-under test. Golden set: 6 questions, including one the document does not answer.*
-
-**Faithfulness 0.96 and relevancy 1.00** are the grounding working — every claim
-traces to the context, and the refusal case scores 1.0 because an answer with no
-factual claims has nothing to hallucinate.
-
-**Context precision 0.21 is the real finding.** Hybrid retrieval trades precision
-for recall: roughly four of every five retrieved chunks are noise. On a
-payment-timing question the retriever returned the fees clause alongside
-limitation-of-liability, governing-law, and confidentiality clauses. The model
-ignored them and answered correctly — but they cost prompt tokens and latency.
-**This is the number a reranking stage should move**, and it is the next thing on
-the roadmap.
-
----
-
-## Tests
-
-The suite mocks the LLM, so it runs offline and in CI without an Ollama process.
-
-```bash
-pytest -v
+# 8. run tests
+pytest
 ```
 
 ---
 
-## Design notes
+## Project layout
 
-**Why grounding is the whole product.** An LLM predicts likely tokens; it has no notion of truth. Asked about something it doesn't know, it produces fluent, plausible, wrong answers. The system prompt instructs the model to answer only from retrieved context and to say *"I don't know"* otherwise. Tested directly: asked for a vacation policy in a services contract that has none, retrieval still returned three chunks — vector search always returns nearest neighbours — and the model correctly refused. That refusal is the behaviour that makes the system trustworthy.
-
-**Why citations are numbered, not just listed.** Chunks are injected as `[1] (page 0) ...` and the model cites `[3]` inline. Each claim maps to a specific chunk ID in the response, so a UI can link every statement back to its source text. "Here are some documents I looked at" is not traceability; "this claim came from this passage" is.
-
-**Why hybrid retrieval.** Pure vector search matches meaning — asking about *cost* correctly finds a clause that says *fee*. But it's weak on exact tokens: party names, case numbers, dollar figures. BM25 keyword matching catches those. Running both and merging gets each one's strength. Verified with the contrast: *"How much does the service cost?"* is won by the vector side, *"Northwind Trading"* by BM25.
-
-**Why the follow-up rewrite.** *"When is it due?"* has no standalone meaning — its embedding retrieves noise. Before retrieving, the query is rewritten against conversation history into *"When is the $25,000 monthly fee due?"*. Retrieval uses the rewritten query; the model still answers the original. Costs one extra LLM call, skipped when there's no history.
-
-**Why ingestion is a separate module.** `Chroma.from_documents()` **appends** — it is not idempotent. Running ingestion inside the query path silently duplicated every chunk on each call, polluting retrieval until the store held ~10 copies and returned the same chunk three times. `ingest.py` writes; `rag_query.py` only reads. Handling document *updates* properly needs deterministic chunk IDs (hash of source + page + index) so re-ingestion upserts rather than appends.
-
-**Why the evaluation judge is a different model.** The first version of the eval
-harness asked the judge for "a number between 0.0 and 1.0" and got 0.5 back on 14
-of 18 scores — including a refusal that makes no factual claims and should have
-been 1.0. The judge was hedging, not evaluating: small models cannot produce
-calibrated continuous scores. The fix is to never ask for a score — decompose the
-answer into atomic claims, ask a binary YES/NO per claim, and compute the fraction
-arithmetically. That is what RAGAS does internally, and it is why it tolerates
-weaker judges. Running the judge on `llama3.2` (the generation model) then scored
-relevancy 0.50 and precision 0.13 while the answers were correctly citing their
-retrieved chunks — a self-contradiction, since a chunk that yields a faithful
-answer is by definition relevant. Swapping to `llama3.1:8b` moved relevancy to
-1.00 and made claim extraction meaningful (1 claim per answer → 3–5). **The judge
-was wrong, not the system.** A small model can do near-extractive judgments
-("does this context support this claim?") but not abstract relevance judgments.
-Validate the judge before trusting the metric — an unvalidated harness will
-confidently tell you to fix things that aren't broken.
-
-**Why RAGAS isn't used.** It was the intended tool. It pins to LangChain internals
-that have since moved: `scikit-network` had no wheel for the installed Python,
-RAGAS imported a `langchain_community` module that had been deleted, and pinning
-`langchain-community` backwards to satisfy it broke `langchain-ollama`. The
-metrics are ~60 lines of prompt and arithmetic, so they are implemented directly.
-A dependency that costs more than the thing it does is not worth the dependency.
-
-**Why `/query` catches its own failures.** Retrieval and generation depend on external services — the Ollama model server and the on-disk vector store. If either is down, the naive result is a 500 with a full Python traceback sent to the client, which is both a poor experience and an information-disclosure risk (it exposes internal paths and stack frames). Instead the endpoint wraps the call in `try/except`: the real traceback is logged server-side with `logger.exception`, and the caller gets a clean `503` with a safe message. Verified by stopping Ollama mid-run — the client received the 503, the diagnostic trace landed in the logs. Logging goes through the `logging` module rather than `print`, so records carry levels and timestamps and can be routed to a collector without code changes.
-
-**Why `temperature=0`.** For grounded Q&A the goal is faithful, reproducible answers, not creativity.
-
-**Why streaming.** A single-shot response makes the user wait for the whole generation — measured at ~18s locally for a cold model. Streaming over SSE emits each token as produced, so time-to-first-token drops to milliseconds. Perceived latency, not total latency, is what users judge.
-
-**Why local inference.** Running `llama3.2` through Ollama removes per-token cost and keeps documents on the machine — which matters in any domain where sending text to a third-party API isn't an option. The trade-off is throughput and peak quality versus a frontier model.
-
-**Known limitation: chunk boundaries.** Fixed-size character splitting cuts across section boundaries — one retrieved chunk contains the tail of the termination clause glued to the start of the fees clause. Retrieval quality is the ceiling on answer quality, so the next improvements are upstream: structure-aware chunking (split on section headings), then reranking a broad candidate set down to the few genuinely relevant chunks.
-
----
-
-## Stack
-
-`Python` · `FastAPI` · `LangChain (LCEL)` · `Ollama` · `ChromaDB` · `nomic-embed-text` · `BM25` · `Pydantic` · `pytest`
-
----
-
-## Roadmap
-
-1. Cross-encoder reranking — retrieve broadly, keep only the relevant few (target: context precision 0.21 → 0.6+)
-2. Structure-aware chunking — split on section headings so a clause is never severed
-3. Metadata filtering for access control (retrieve only what a user may see)
-4. Containerization, CI/CD, and a live deployment
-
----
-
-## License
-
-MIT
+```
+ingest.py                     structure-aware chunking + embedding (writes the store)
+src/app/rag_query.py          hybrid retrieval + reranking + grounded generation (reads)
+src/app/langgraph_selfcorrect.py   self-correcting agentic RAG graph
+src/app/main.py               FastAPI endpoint with error handling + structured logging
+evaluate_rag.py               LLM-as-judge evaluation harness
+tests/                        pytest suite (LLM mocked)
+```
