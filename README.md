@@ -125,7 +125,7 @@ an unvalidated harness will confidently tell you to fix things that aren't broke
 
 ## Agentic RAG (LangGraph) — optional self-correcting path
 
-`langgraph_selfcorrect.py` implements a self-correcting retrieval loop as a LangGraph
+`Langgraph_selfcorrect.py` implements a self-correcting retrieval loop as a LangGraph
 state machine. It adds one capability a straight chain can't express: a **conditional
 branch and a cycle**.
 
@@ -184,7 +184,7 @@ python ingest.py
 python -m src.app.rag_query
 
 # 5. or run the self-correcting graph
-python -m src.app.langgraph_selfcorrect
+python -m src.app.Langgraph_selfcorrect
 
 # 6. run the evaluation harness
 python evaluate_rag.py
@@ -203,7 +203,7 @@ pytest
 ```
 ingest.py                     structure-aware chunking + embedding (writes the store)
 src/app/rag_query.py          hybrid retrieval + reranking + grounded generation (reads)
-src/app/langgraph_selfcorrect.py   self-correcting agentic RAG graph
+src/app/Langgraph_selfcorrect.py   self-correcting agentic RAG graph
 src/app/main.py               FastAPI endpoint with error handling + structured logging
 evaluate_rag.py               LLM-as-judge evaluation harness
 tests/                        pytest suite (LLM mocked)
