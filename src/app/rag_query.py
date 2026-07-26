@@ -1,13 +1,19 @@
-"""RAG: hybrid retrieval over an ingested document, then a grounded answer.
+"""RAG with reranking: retrieve broadly, rerank with a cross-encoder, keep the best.
 
-This module only READS the vector store. Ingestion (writing) lives in
-ingest.py and runs separately — mixing the two is what causes duplicate
-chunks, because Chroma.from_documents() appends on every call.
+Only READS the vector store (ingest.py writes it).
 
-Retrieval is hybrid: a dense vector search (semantic) merged with BM25
-(exact keyword). The BM25 index is rebuilt in memory at startup from the
-documents already stored in Chroma, so there is still a single source of
-truth and no second index to keep in sync.
+Retrieval is a two-stage funnel:
+  1. HYBRID (vector + BM25) casts a WIDE net — high recall, retrieve ~10 candidates.
+     Vector alone missed exact-term answers (e.g. "$25,000 monthly fee"); BM25 catches them.
+  2. RERANK with a cross-encoder scores each (query, chunk) pair jointly and keeps the
+     top few — high precision. This is what drops the 4-of-5 noise chunks the retriever
+     returns. Measured context precision was ~0.18 (≈1 relevant chunk per 5) before reranking.
+
+Why two stages: a bi-encoder (embeddings) encodes query and chunk SEPARATELY and compares
+by cosine — fast enough to search the whole corpus, but imprecise. A cross-encoder reads
+(query, chunk) TOGETHER — far more accurate, but too slow to run over every chunk. So you
+retrieve broadly with the fast method, then rerank the small candidate set with the slow,
+accurate one. Standard production pattern.
 """
 
 from langchain_chroma import Chroma
@@ -16,12 +22,15 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from sentence_transformers import CrossEncoder
 
 CHROMA_DIR = "./chroma_db"
 EMBED_MODEL = "nomic-embed-text"
 CHAT_MODEL = "llama3.2"
-TOP_K = 3          # per retriever
-MAX_CONTEXT = 5    # cap after merging, to bound prompt size
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+RETRIEVE_K = 10     # cast a wide net (per retriever) before reranking
+FINAL_K = 3         # keep this many after reranking
 
 
 # --------------------------------------------------------------------------
@@ -48,8 +57,8 @@ REWRITE_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             "Given the conversation history and a follow-up question, rewrite the "
-            "follow-up as a standalone question that makes sense without the history. "
-            "Do not answer it. Return only the rewritten question.",
+            "follow-up as a standalone question. Do not answer it. Return only the "
+            "rewritten question.",
         ),
         ("human", "History:\n{history}\n\nFollow-up: {question}"),
     ]
@@ -57,68 +66,63 @@ REWRITE_PROMPT = ChatPromptTemplate.from_messages(
 
 
 # --------------------------------------------------------------------------
-# Store + models — built once at import, reused across requests
+# Store, models, retrievers — built once at import
 # --------------------------------------------------------------------------
 embeddings = OllamaEmbeddings(model=EMBED_MODEL)
-
-# Chroma(...) READS an existing store. Never use from_documents() here.
 store = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
-vector_retriever = store.as_retriever(search_kwargs={"k": TOP_K})
+vector_retriever = store.as_retriever(search_kwargs={"k": RETRIEVE_K})
 
+# Rebuild BM25 in-memory from chunks already in Chroma (no PDF re-parse).
+_raw = store.get()
+_docs = [
+    Document(page_content=t, metadata=m or {})
+    for t, m in zip(_raw["documents"], _raw["metadatas"])
+]
+bm25_retriever = BM25Retriever.from_documents(_docs)
+bm25_retriever.k = RETRIEVE_K
 
-def _load_chunks_from_store() -> list[Document]:
-    """Read every stored chunk back out of Chroma, as Documents.
-
-    Chroma persists the original text alongside the vectors, so BM25 can be
-    rebuilt from the store itself — no need to re-parse the source PDF, and
-    no second index file to keep in sync.
-    """
-    raw = store.get()  # {'ids': [...], 'documents': [...], 'metadatas': [...]}
-    return [
-        Document(page_content=text, metadata=meta or {})
-        for text, meta in zip(raw["documents"], raw["metadatas"])
-    ]
-
-
-# BM25 is an in-memory index — unlike Chroma it does not persist, so it is
-# rebuilt on each startup. Cheap at this scale; at large scale you would use
-# a store that does both keyword and vector search (e.g. OpenSearch).
-_chunks = _load_chunks_from_store()
-bm25_retriever = BM25Retriever.from_documents(_chunks) if _chunks else None
-if bm25_retriever:
-    bm25_retriever.k = TOP_K
+# Cross-encoder reranker — loaded once (downloads on first run, then cached).
+reranker = CrossEncoder(RERANK_MODEL)
 
 llm = ChatOllama(model=CHAT_MODEL, temperature=0)
-
 rag_chain = RAG_PROMPT | llm | StrOutputParser()
 rewrite_chain = REWRITE_PROMPT | llm | StrOutputParser()
 
 
 # --------------------------------------------------------------------------
-# Retrieval
+# Retrieval: hybrid recall  ->  cross-encoder precision
 # --------------------------------------------------------------------------
-def hybrid_search(query: str) -> list[Document]:
-    """Merge dense (semantic) and sparse (keyword) retrieval.
-
-    Vector search matches meaning — "cost" finds a clause that says "fee".
-    BM25 matches exact tokens — party names, case numbers, dollar figures —
-    which dense embeddings represent weakly. Running both covers each one's
-    blind spot.
-    """
-    hits: list[Document] = vector_retriever.invoke(query)
-    if bm25_retriever:
-        hits = hits + bm25_retriever.invoke(query)
-
+def _hybrid_candidates(query: str) -> list[Document]:
+    """Wide net: union vector + BM25, dedupe by content. High recall."""
+    hits = vector_retriever.invoke(query) + bm25_retriever.invoke(query)
     seen, merged = set(), []
     for doc in hits:
         if doc.page_content not in seen:
             seen.add(doc.page_content)
             merged.append(doc)
-    return merged[:MAX_CONTEXT]
+    return merged
 
 
-def format_context(docs: list[Document]) -> str:
-    """Number each chunk so the model can cite it by index."""
+def rerank(query: str, docs: list[Document], top_k: int = FINAL_K) -> list[Document]:
+    """Score each (query, chunk) pair with the cross-encoder; keep the top_k."""
+    if not docs:
+        return []
+    pairs = [(query, d.page_content) for d in docs]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in ranked[:top_k]]
+
+
+def retrieve(query: str) -> list[Document]:
+    """Full two-stage retrieval: hybrid recall, then cross-encoder precision."""
+    candidates = _hybrid_candidates(query)   # ~up to 2*RETRIEVE_K, deduped
+    return rerank(query, candidates)         # trimmed to FINAL_K best
+
+
+# --------------------------------------------------------------------------
+# Generation
+# --------------------------------------------------------------------------
+def format_context(docs) -> str:
     parts = []
     for i, doc in enumerate(docs, 1):
         page = doc.metadata.get("page", "?")
@@ -127,56 +131,29 @@ def format_context(docs: list[Document]) -> str:
 
 
 def rewrite_query(question: str, history: list[str]) -> str:
-    """Turn a context-dependent follow-up into a standalone search query.
-
-    "When is it due?" + history  ->  "When is the $25,000 monthly fee due?"
-    Skipped when there is no history, to avoid a wasted LLM call.
-    """
     if not history:
         return question
-    return rewrite_chain.invoke(
-        {"history": "\n".join(history), "question": question}
-    )
+    return rewrite_chain.invoke({"history": "\n".join(history), "question": question})
 
 
 def answer_question(question: str, history: list[str] | None = None):
-    """Retrieve -> augment -> generate.
+    """Retrieve (hybrid + rerank) -> augment -> generate.
 
-    Retrieval uses the REWRITTEN query (so follow-ups find the right chunks),
-    but the model answers the ORIGINAL question the user actually asked.
-
-    Returns (answer, retrieved_docs) so the caller can cite sources.
+    Retrieval uses the REWRITTEN query; generation answers the ORIGINAL question.
+    Returns (answer, docs) so the caller can cite sources.
     """
     search_query = rewrite_query(question, history or [])
-    docs = hybrid_search(search_query)                      # 1. RETRIEVE
-    context = format_context(docs)                          # 2. AUGMENT
-    answer = rag_chain.invoke(                              # 3. GENERATE
-        {"context": context, "question": question}
-    )
+    docs = retrieve(search_query)
+    context = format_context(docs)
+    answer = rag_chain.invoke({"context": context, "question": question})
     return answer, docs
 
 
 if __name__ == "__main__":
-    print(f"Loaded {len(_chunks)} chunks from the store "
-          f"(BM25: {'on' if bm25_retriever else 'off'})")
-
-    tests = [
-        ("How much does the service cost?", []),            # semantic win
-        ("Northwind Trading", []),                          # exact-term / BM25 win
-        ("What is the employee vacation policy?", []),      # not in the doc
-        (
-            "When is it due?",                              # follow-up
-            ["Q: How much does the service cost?",
-             "A: The monthly fee is $25,000."],
-        ),
-    ]
-    for q, hist in tests:
-        ans, srcs = answer_question(q, hist)
-        print(f"\n{'=' * 60}")
-        print(f"Q: {q}")
-        if hist:
-            print(f"   (rewritten -> {rewrite_query(q, hist)!r})")
-        print(f"A: {ans}\n")
-        print("Sources:")
+    for q in ["How much does the service cost?",
+              "What is the employee vacation policy?"]:
+        ans, srcs = answer_question(q)
+        print(f"\n{'='*60}\nQ: {q}\nA: {ans}\n")
+        print(f"Sources ({len(srcs)} after rerank):")
         for i, d in enumerate(srcs, 1):
-            print(f"  [{i}] page {d.metadata.get('page')}: {d.page_content[:70]}...")
+            print(f"  [{i}] page {d.metadata.get('page')}: {d.page_content[:65]}...")
