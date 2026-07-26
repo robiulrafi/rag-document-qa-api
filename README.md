@@ -204,7 +204,14 @@ pytest
 ingest.py                     structure-aware chunking + embedding (writes the store)
 src/app/rag_query.py          hybrid retrieval + reranking + grounded generation (reads)
 src/app/Langgraph_selfcorrect.py   self-correcting agentic RAG graph
-src/app/main.py               FastAPI endpoint with error handling + structured logging
+src/app/chains.py             plain Q&A + structured-output (Pydantic) chains
+src/app/config.py             model / connection settings
+src/app/main.py               FastAPI app — RAG, chat, and structured-output endpoints;
+                              error handling + structured logging
 evaluate_rag.py               LLM-as-judge evaluation harness
 tests/                        pytest suite (LLM mocked)
 ```
+
+Beyond RAG, the API also exposes a plain Q&A endpoint and a structured-output
+endpoint that returns a validated Pydantic object (summary + confidence) via
+`with_structured_output` — a demonstration of schema-enforced LLM responses.
