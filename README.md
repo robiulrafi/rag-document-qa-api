@@ -1,13 +1,9 @@
 # RAG Document Q&A API
-<<<<<<< HEAD
-=======
-
->>>>>>> 4ae26a8f782f1960f6707ef468d19fbcba0eb5fb
 ![CI](https://github.com/robiulrafi/rag-document-qa-api/actions/workflows/ci.yml/badge.svg)
 A production-oriented Retrieval-Augmented Generation system that answers questions
 about a document with **grounded, cited answers** — and refuses when the answer
 isn't there. Built to handle the failure modes that separate a demo from something
-you'd trust: hallucination, missing citations, and unmeasured retrieval quality.
+you would trust: hallucination, missing citations, and unmeasured retrieval quality.
 
 Runs fully locally (Ollama + ChromaDB) — no API keys, no data leaving the machine,
 which matters for the confidential-document use cases this targets.
