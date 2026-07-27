@@ -78,8 +78,13 @@ _docs = [
     Document(page_content=t, metadata=m or {})
     for t, m in zip(_raw["documents"], _raw["metadatas"])
 ]
-bm25_retriever = BM25Retriever.from_documents(_docs)
-bm25_retriever.k = RETRIEVE_K
+if _docs:
+    bm25_retriever = BM25Retriever.from_documents(_docs)
+    bm25_retriever.k = RETRIEVE_K
+else:
+    bm25_retriever = None
+    print("[rag_query] WARNING: vector store is empty — BM25 disabled, "
+          "vector-only retrieval until documents are ingested.")
 
 # Cross-encoder reranker — loaded once (downloads on first run, then cached).
 reranker = CrossEncoder(RERANK_MODEL)
@@ -94,7 +99,9 @@ rewrite_chain = REWRITE_PROMPT | llm | StrOutputParser()
 # --------------------------------------------------------------------------
 def _hybrid_candidates(query: str) -> list[Document]:
     """Wide net: union vector + BM25, dedupe by content. High recall."""
-    hits = vector_retriever.invoke(query) + bm25_retriever.invoke(query)
+    hits = vector_retriever.invoke(query)
+    if bm25_retriever is not None:
+        hits = hits + bm25_retriever.invoke(query)
     seen, merged = set(), []
     for doc in hits:
         if doc.page_content not in seen:
