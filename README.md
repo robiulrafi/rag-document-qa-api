@@ -1,15 +1,21 @@
 # RAG Document Q&A API
+
 ![CI](https://github.com/robiulrafi/rag-document-qa-api/actions/workflows/ci.yml/badge.svg)
+
+**🔗 [Try the live demo](https://rag-document-app-api.streamlit.app/)** — paste a document, ask a question, get a grounded answer with citations (or an honest "I don't know").
+
 A production-oriented Retrieval-Augmented Generation system that answers questions
 about a document with **grounded, cited answers** — and refuses when the answer
 isn't there. Built to handle the failure modes that separate a demo from something
-you would trust: hallucination, missing citations, and unmeasured retrieval quality.
+you'd trust: hallucination, missing citations, and unmeasured retrieval quality.
 
 Runs fully locally (Ollama + ChromaDB) — no API keys, no data leaving the machine,
 which matters for the confidential-document use cases this targets.
 
 **Stack:** Python · FastAPI · LangChain (LCEL) · LangGraph · Ollama (llama3.2) ·
-ChromaDB · nomic-embed-text · BM25 · cross-encoder reranking · pytest
+ChromaDB · nomic-embed-text · BM25 · cross-encoder reranking · pytest · Docker · GitHub Actions CI
+
+The local app runs fully on-device with Ollama (private, no API keys). The [live demo](https://rag-document-app-api.streamlit.app/) swaps in Groq for hosted inference so it can run on Streamlit Cloud — same retrieval pipeline (structure-aware chunking → hybrid retrieval → cross-encoder reranking → grounded generation), different LLM backend.
 
 ---
 
