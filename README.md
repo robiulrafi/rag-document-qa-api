@@ -1,5 +1,5 @@
 # RAG Document Q&A API
-
+![CI](https://github.com/robiulrafi/rag-document-qa-api/actions/workflows/ci.yml/badge.svg)
 A production-oriented Retrieval-Augmented Generation system that answers questions
 about a document with **grounded, cited answers** — and refuses when the answer
 isn't there. Built to handle the failure modes that separate a demo from something
