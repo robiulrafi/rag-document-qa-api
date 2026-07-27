@@ -198,6 +198,50 @@ pytest
 
 ---
 
+## Running in Docker
+
+The app is containerized. The image is **stateless** — the vector store is mounted
+as a volume, and the LLM (Ollama) runs on the host, not in the container. This keeps
+the image small and portable: the same image runs anywhere by changing configuration.
+
+```bash
+# 1. build the image
+docker build -t rag-api .
+
+# 2. make sure Ollama is running on the host, listening on all interfaces
+#    (not just localhost, so the container can reach it)
+#    PowerShell:  $env:OLLAMA_HOST="0.0.0.0:11434"; ollama serve
+ollama list      # confirm llama3.2, llama3.1:8b, nomic-embed-text are present
+
+# 3. run the container
+#    - publishes port 8000
+#    - points the app at Ollama on the host via host.docker.internal
+#    - mounts the existing vector store as a volume
+docker run -p 8000:8000 \
+  -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+  --add-host=host.docker.internal:host-gateway \
+  -v /absolute/path/to/chroma_db:/app/chroma_db \
+  rag-api
+
+# 4. open the API docs
+#    http://localhost:8000/docs
+```
+
+**Design notes (and a real lesson learned):**
+- **Config over code.** Every Ollama client reads `OLLAMA_BASE_URL` from the environment
+  (defaulting to `localhost:11434`). Locally that default works; in a container it doesn't —
+  `localhost` inside a container is the container itself, not the host. Threading a
+  configurable base URL through every client is what lets one image run in both places.
+  (This surfaced as a 503-in-Docker-but-fine-locally bug — the clients had hardcoded the
+  default — and the fix was twelve-factor config.)
+- **Ollama stays external.** The model server runs on the host; the container connects out
+  to it. The image doesn't bake in multi-GB models, so it stays lean.
+- **Data is mounted, not baked in.** `chroma_db` is a volume, so the image is stateless and
+  the store can be rebuilt or swapped without rebuilding the image. `.dockerignore` excludes
+  `venv/`, `chroma_db/`, caches, and `.git` so the build context stays small.
+- **Layer caching.** `requirements.txt` is copied and installed *before* the app code, so
+  editing a `.py` file doesn't re-install the (heavy) dependency layer on rebuild.
+
 ## Project layout
 
 ```
@@ -210,6 +254,8 @@ src/app/main.py               FastAPI app — RAG, chat, and structured-output e
                               error handling + structured logging
 evaluate_rag.py               LLM-as-judge evaluation harness
 tests/                        pytest suite (LLM mocked)
+Dockerfile                    containerizes the API (Python 3.12-slim base)
+.dockerignore                 keeps the build context small
 ```
 
 Beyond RAG, the API also exposes a plain Q&A endpoint and a structured-output
