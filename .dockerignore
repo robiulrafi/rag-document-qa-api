@@ -1,0 +1,12 @@
+# Don't copy these into the image — they bloat it or don't belong
+venv*/
+.venv/
+__pycache__/
+*.pyc
+chroma_db/
+.git/
+.gitignore
+.pytest_cache/
+*.md
+.env
+.cache/

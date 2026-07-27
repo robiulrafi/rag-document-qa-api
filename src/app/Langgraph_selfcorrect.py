@@ -17,7 +17,7 @@ conditional branch.
 Reuses the functions already built and measured in src.app.rag_query — the graph
 is control flow ON TOP of the existing pipeline, not a reimplementation.
 """
-
+from .config import settings
 from typing import TypedDict
 
 from langchain_core.output_parsers import StrOutputParser
@@ -33,7 +33,7 @@ MAX_ATTEMPTS = 2          # loop guard: how many rewrites before giving up
 RELEVANCE_THRESHOLD = 1   # need at least this many relevant chunks to proceed
 
 # A grader model — separate/stronger than the generator, same lesson as the eval harness.
-grader_llm = ChatOllama(model="llama3.1:8b", temperature=0)
+grader_llm = ChatOllama(model="llama3.1:8b", temperature=0,base_url=settings.OLLAMA_BASE_URL)
 GRADE_PROMPT = ChatPromptTemplate.from_template(
     "Is this CHUNK relevant to answering the QUESTION?\n"
     "Answer with one word: YES or NO.\n\n"

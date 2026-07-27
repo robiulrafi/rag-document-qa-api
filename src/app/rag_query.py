@@ -15,7 +15,7 @@ by cosine — fast enough to search the whole corpus, but imprecise. A cross-enc
 retrieve broadly with the fast method, then rerank the small candidate set with the slow,
 accurate one. Standard production pattern.
 """
-
+from .config import settings
 from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
@@ -68,7 +68,7 @@ REWRITE_PROMPT = ChatPromptTemplate.from_messages(
 # --------------------------------------------------------------------------
 # Store, models, retrievers — built once at import
 # --------------------------------------------------------------------------
-embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+embeddings = OllamaEmbeddings(model=EMBED_MODEL,base_url=settings.OLLAMA_BASE_URL,)
 store = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
 vector_retriever = store.as_retriever(search_kwargs={"k": RETRIEVE_K})
 
@@ -84,7 +84,7 @@ bm25_retriever.k = RETRIEVE_K
 # Cross-encoder reranker — loaded once (downloads on first run, then cached).
 reranker = CrossEncoder(RERANK_MODEL)
 
-llm = ChatOllama(model=CHAT_MODEL, temperature=0)
+llm = ChatOllama(model=CHAT_MODEL, temperature=0,base_url=settings.OLLAMA_BASE_URL,)
 rag_chain = RAG_PROMPT | llm | StrOutputParser()
 rewrite_chain = REWRITE_PROMPT | llm | StrOutputParser()
 
