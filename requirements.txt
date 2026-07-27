@@ -3,26 +3,32 @@ fastapi>=0.115
 uvicorn[standard]>=0.34
 pydantic>=2.11
 
-# --- LLM + RAG (local, $0 — no API keys required) ---
+# --- LLM + RAG core ---
 langchain>=0.3.14
 langchain-core>=0.3.29
-langchain-ollama>=0.2.2
-langchain-chroma>=0.2.0            # vector store wrapper
-langchain-community>=0.3.0        # BM25Retriever, PyPDFLoader
-langchain-text-splitters>=0.3.0   # RecursiveCharacterTextSplitter (fallback splitter)
+langchain-ollama>=0.2.2          # local inference (Ollama)
+langchain-groq>=0.2.0            # hosted inference (Streamlit demo)
+langchain-chroma>=0.2.0
+langchain-community>=0.3.0       # BM25Retriever, loaders
+langchain-text-splitters>=0.3.0
+langchain-huggingface>=0.1.0     # embeddings for the demo
 
-# --- Vector store + embeddings ---
-chromadb>=0.5.0
-pypdf>=5.0                         # PDF loading (PyPDFLoader backend)
+# --- Vector stores + embeddings ---
+chromadb>=0.5.0                  # local/production store
+faiss-cpu>=1.9.0                 # in-memory store for the demo
+pypdf>=5.0
 
-# --- Hybrid retrieval (BM25 keyword search) ---
+# --- Hybrid retrieval + reranking ---
 rank-bm25>=0.2.2
+sentence-transformers>=3.0
+torch>=2.0
+torchvision>=0.15                # required by sentence-transformers model loading
 
-# --- Cross-encoder reranking ---
-sentence-transformers>=3.0        # CrossEncoder (ms-marco-MiniLM-L-6-v2)
+# --- Agentic ---
+langgraph>=0.2.0
 
-# --- Agentic RAG ---
-langgraph>=0.2.0                  # self-correcting graph
+# --- Demo UI ---
+streamlit>=1.40
 
 # --- Testing ---
 pytest>=8.3
